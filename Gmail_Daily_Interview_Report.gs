@@ -1,9 +1,15 @@
-// Daily Gmail Report (Gemini)
+// Daily Gmail Report (Gemini) - PUBLIC-SAFE VERSION
 // Script Properties:
 //   GEMINI_API_KEY
 //   GEMINI_MODEL (e.g. models/gemini-2.5-flash)
 // Optional:
 //   REPORT_RECIPIENT
+//
+// Public-safe changes:
+// 1) Uses Gmail snippet ONLY (no getPlainBody)
+// 2) Shorter snippet length (default 400 chars)
+// 3) Prompt includes strict redaction rules (OTP/verification codes/personal data)
+// 4) Avoids logging or emitting raw model output / raw snippets anywhere
 
 const DRY_RUN = false;
 const TZ = "America/Los_Angeles";
@@ -11,6 +17,7 @@ const MAX_THREADS = 150;
 const BATCH_SIZE = 30;
 const MAX_OUT_TOKENS = 6000;
 const LOW_CONF = 0.7;
+const SNIPPET_MAX_CHARS = 400;
 
 function sendDailyGmailReport_Gemini() {
   const apiKey = getProp_("GEMINI_API_KEY");
@@ -19,8 +26,8 @@ function sendDailyGmailReport_Gemini() {
   const to = PropertiesService.getScriptProperties().getProperty("REPORT_RECIPIENT") || Session.getActiveUser().getEmail();
 
   const now = new Date();
-  const start = new Date(now); start.setDate(start.getDate() - 1); start.setHours(0,0,0,0);
-  const end = new Date(now); end.setHours(0,0,0,0);
+  const start = new Date(now); start.setDate(start.getDate() - 1); start.setHours(0, 0, 0, 0);
+  const end = new Date(now); end.setHours(0, 0, 0, 0);
 
   const startStr = Utilities.formatDate(start, TZ, "yyyy/MM/dd");
   const endStr = Utilities.formatDate(end, TZ, "yyyy/MM/dd");
@@ -29,11 +36,17 @@ function sendDailyGmailReport_Gemini() {
   const threads = GmailApp.search(query, 0, MAX_THREADS);
 
   if (!threads || threads.length === 0) {
-    if (!DRY_RUN) MailApp.sendEmail(to, `Daily Gmail Report (${startStr}) - 0 emails`, `No matching emails received on ${startStr}.`);
+    if (!DRY_RUN) {
+      MailApp.sendEmail(
+        to,
+        `Daily Gmail Report (${startStr}) - 0 emails`,
+        `No matching emails received on ${startStr}.`
+      );
+    }
     return;
   }
 
-  // Build items + mapping
+  // Build items + mapping (PUBLIC-SAFE: snippet ONLY, no plain body)
   const items = [];
   const map = {};
   for (let i = 0; i < threads.length; i++) {
@@ -41,19 +54,25 @@ function sendDailyGmailReport_Gemini() {
     const msg = th.getMessages().slice(-1)[0];
     const id = "e" + (i + 1);
 
+    const safeSnippet = (msg.getSnippet() || "")
+      .replace(/\s+/g, " ")
+      .slice(0, SNIPPET_MAX_CHARS);
+
     items.push({
       id,
       time: Utilities.formatDate(msg.getDate(), TZ, "yyyy-MM-dd HH:mm"),
       from: msg.getFrom(),
       subject: msg.getSubject() || "(no subject)",
-      snippet: (msg.getPlainBody() || msg.getSnippet() || "").replace(/\s+/g, " ").slice(0, 800)
+      snippet: safeSnippet
     });
+
     map[id] = th.getId();
   }
 
-  // Classify in batches
+  // Classify in batches (reduce truncation risk)
   const parsed = [];
   const batches = chunk_(items, BATCH_SIZE);
+
   for (let b = 0; b < batches.length; b++) {
     const payload = batches[b].map(it =>
       `ID: ${it.id}\nTime: ${it.time}\nFrom: ${it.from}\nSubject: ${it.subject}\nSnippet: ${it.snippet}`
@@ -62,6 +81,7 @@ function sendDailyGmailReport_Gemini() {
     const prompt = buildPrompt_(payload);
     const raw = callGemini_(apiKey, model, prompt, MAX_OUT_TOKENS);
     const arr = safeJsonParse_(raw);
+
     if (Array.isArray(arr)) parsed.push(...arr);
   }
 
@@ -98,7 +118,7 @@ function sendDailyGmailReport_Gemini() {
       const row = inviteRow_(x, confidence);
       invites.push(row);
 
-      // immediate alert
+      // Immediate alert (public-safe: does not include original email snippet, only model's short justification)
       if (!DRY_RUN) {
         const subj = `Interview Invite Detected: ${row.company} – ${row.position}`;
         const body =
@@ -111,7 +131,7 @@ Proposed times: ${row.proposed_times.length ? row.proposed_times.join(", ") : "N
 Urgency: ${row.urgency}
 Confidence: ${row.confidence}
 
-Reason:
+Reason (redacted-safe):
 ${row.snippet}
 `;
         MailApp.sendEmail(to, subj, body);
@@ -128,8 +148,10 @@ ${row.snippet}
     counts.other++;
   });
 
-  const report = buildReport_(startStr, threads.length, counts, invites, reviews);
-  if (!DRY_RUN) MailApp.sendEmail(to, `Daily Gmail Report (${startStr}) - ${threads.length} emails`, report);
+  const report = buildReport_(threads.length, counts, invites, reviews);
+  if (!DRY_RUN) {
+    MailApp.sendEmail(to, `Daily Gmail Report (${startStr}) - ${threads.length} emails`, report);
+  }
 }
 
 
@@ -138,6 +160,12 @@ ${row.snippet}
 function buildPrompt_(emailsPayload) {
   return `
 You are an assistant that classifies emails for a job seeker.
+
+PRIVACY / REDACTION RULES (strict):
+- Do NOT output any one-time passwords (OTP), verification codes, passcodes, reset codes, or security tokens.
+- If an email snippet contains a code or sensitive personal data, you must REDACT it in your output (replace with "[REDACTED]").
+- Do NOT include phone numbers, street addresses, or any personal identifiers beyond what is necessary to classify.
+- Keep "snippet" as a short justification; do not copy long text from the email.
 
 For each email item, output one JSON object with:
 - id
@@ -148,7 +176,7 @@ For each email item, output one JSON object with:
 - proposed_times (array or null)
 - urgency: "high" | "normal"
 - confidence: number 0-1
-- snippet: short justification
+- snippet: short justification (privacy-safe)
 
 IMPORTANT: Return ONLY a valid JSON array. No extra text.
 
@@ -199,7 +227,7 @@ function safeJsonParse_(text) {
   }
 }
 
-function buildReport_(dateStr, total, counts, invites, reviews) {
+function buildReport_(total, counts, invites, reviews) {
   let out =
 `OVERVIEW
 --------
@@ -271,7 +299,7 @@ function inviteRow_(x, confidence) {
     proposed_times: proposed,
     urgency: x.urgency || "normal",
     confidence: confidence,
-    snippet: x.snippet || ""
+    snippet: sanitizeText_(x.snippet || "")
   };
 }
 
@@ -285,8 +313,15 @@ function minRow_(x, confidence, category) {
     contact: x.contact || "",
     proposed_times: proposed,
     confidence: confidence,
-    snippet: x.snippet || ""
+    snippet: sanitizeText_(x.snippet || "")
   };
+}
+
+// Small extra defense: redact obvious numeric codes if they slip through
+function sanitizeText_(s) {
+  const text = String(s || "").trim();
+  // Replace sequences that look like OTP/codes (6-10 digits)
+  return text.replace(/\b\d{6,10}\b/g, "[REDACTED]");
 }
 
 function getProp_(k) {
@@ -305,3 +340,4 @@ function chunk_(arr, size) {
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
   return out;
 }
+
