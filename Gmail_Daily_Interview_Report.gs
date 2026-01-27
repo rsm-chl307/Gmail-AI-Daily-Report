@@ -10,6 +10,17 @@
 // 2) Shorter snippet length (default 400 chars)
 // 3) Prompt includes strict redaction rules (OTP/verification codes/personal data)
 // 4) Avoids logging or emitting raw model output / raw snippets anywhere
+//
+// CHANGELOG (post-public-v1; bugfix + stability):
+// A) Prevent alert-email feedback loop:
+//    - Exclude self-sent "Interview Invite Detected:" alert emails from the daily Gmail query.
+//    - This prevents Gemini from re-classifying yesterday's alert email as a new interview invite.
+// B) Add dedupe for interview alerts:
+//    - Store alerted threadIds in Script Properties (ALERTED_THREAD_<threadId>).
+//    - Avoid repeatedly sending alerts for the same Gmail thread across multiple days.
+//    - Includes optional cleanup to keep properties from growing forever.
+// C) Add retry for transient Gemini API errors (503/UNAVAILABLE):
+//    - Exponential backoff (1s, 2s, 4s) up to MAX_RETRIES.
 
 const DRY_RUN = false;
 const TZ = "America/Los_Angeles";
@@ -18,6 +29,12 @@ const BATCH_SIZE = 30;
 const MAX_OUT_TOKENS = 6000;
 const LOW_CONF = 0.7;
 const SNIPPET_MAX_CHARS = 400;
+
+// CHANGE: Retry settings for transient Gemini errors
+const MAX_RETRIES = 3;
+
+// CHANGE: Dedupe/cleanup settings
+const ALERT_DEDUPE_DAYS = 30; // keep "already alerted" records for 30 days
 
 function sendDailyGmailReport_Gemini() {
   const apiKey = getProp_("GEMINI_API_KEY");
@@ -31,7 +48,14 @@ function sendDailyGmailReport_Gemini() {
 
   const startStr = Utilities.formatDate(start, TZ, "yyyy/MM/dd");
   const endStr = Utilities.formatDate(end, TZ, "yyyy/MM/dd");
-  const query = `in:inbox category:primary after:${startStr} before:${endStr}`;
+
+  // CHANGE: Prevent feedback loop by excluding self-sent alert emails
+  // -from:me avoids most self-generated emails re-entering the pipeline
+  // -subject:"Interview Invite Detected:" is an extra safeguard in case of aliases/forwarding
+  const myEmail = Session.getActiveUser().getEmail();
+  const query =
+    `in:inbox category:primary after:${startStr} before:${endStr} ` +
+    `-from:${myEmail} -subject:"Interview Invite Detected:"`;
 
   const threads = GmailApp.search(query, 0, MAX_THREADS);
 
@@ -45,6 +69,9 @@ function sendDailyGmailReport_Gemini() {
     }
     return;
   }
+
+  // CHANGE: Optional cleanup to prevent Script Properties growth
+  cleanupOldAlertRecords_(ALERT_DEDUPE_DAYS);
 
   // Build items + mapping (PUBLIC-SAFE: snippet ONLY, no plain body)
   const items = [];
@@ -79,9 +106,11 @@ function sendDailyGmailReport_Gemini() {
     ).join("\n\n---\n\n");
 
     const prompt = buildPrompt_(payload);
-    const raw = callGemini_(apiKey, model, prompt, MAX_OUT_TOKENS);
-    const arr = safeJsonParse_(raw);
 
+    // CHANGE: Retry wrapper for transient errors
+    const raw = callGeminiWithRetry_(apiKey, model, prompt, MAX_OUT_TOKENS, MAX_RETRIES);
+
+    const arr = safeJsonParse_(raw);
     if (Array.isArray(arr)) parsed.push(...arr);
   }
 
@@ -118,10 +147,17 @@ function sendDailyGmailReport_Gemini() {
       const row = inviteRow_(x, confidence);
       invites.push(row);
 
-      // Immediate alert (public-safe: does not include original email snippet, only model's short justification)
-      if (!DRY_RUN) {
-        const subj = `Interview Invite Detected: ${row.company} – ${row.position}`;
-        const body =
+      // CHANGE: Dedupe - alert only once per Gmail thread
+      // Prevents repeated alerts for the same interview thread across multiple days.
+      const alreadyAlerted = threadId ? isThreadAlerted_(threadId) : false;
+
+      if (!alreadyAlerted && threadId) {
+        markThreadAlerted_(threadId);
+
+        // Immediate alert (public-safe: does not include original email snippet, only model's short justification)
+        if (!DRY_RUN) {
+          const subj = `Interview Invite Detected: ${row.company} – ${row.position}`;
+          const body =
 `An interview invitation was detected.
 
 Company: ${row.company}
@@ -134,8 +170,10 @@ Confidence: ${row.confidence}
 Reason (redacted-safe):
 ${row.snippet}
 `;
-        MailApp.sendEmail(to, subj, body);
+          MailApp.sendEmail(to, subj, body);
+        }
       }
+
       return;
     }
 
@@ -208,6 +246,29 @@ function callGemini_(apiKey, model, prompt, maxOut) {
   const obj = JSON.parse(text);
   const parts = obj?.candidates?.[0]?.content?.parts || [];
   return parts.map(p => p.text).filter(Boolean).join("").trim();
+}
+
+// CHANGE: Retry wrapper for transient failures (503 / UNAVAILABLE)
+function callGeminiWithRetry_(apiKey, model, prompt, maxOut, maxRetries) {
+  maxRetries = maxRetries || 3;
+  let lastErr;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return callGemini_(apiKey, model, prompt, maxOut);
+    } catch (e) {
+      lastErr = e;
+      const msg = String((e && e.message) || e);
+
+      // Retry only for transient errors
+      if (msg.includes("503") || msg.includes("UNAVAILABLE")) {
+        Utilities.sleep(Math.pow(2, attempt - 1) * 1000); // 1s, 2s, 4s
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr;
 }
 
 function safeJsonParse_(text) {
@@ -341,3 +402,35 @@ function chunk_(arr, size) {
   return out;
 }
 
+
+// ---------- CHANGE: Dedupe helpers ----------
+
+function alertedKey_(threadId) {
+  return `ALERTED_THREAD_${threadId}`;
+}
+
+function isThreadAlerted_(threadId) {
+  const props = PropertiesService.getScriptProperties();
+  return !!props.getProperty(alertedKey_(threadId));
+}
+
+function markThreadAlerted_(threadId) {
+  const props = PropertiesService.getScriptProperties();
+  // store timestamp for optional cleanup
+  props.setProperty(alertedKey_(threadId), String(Date.now()));
+}
+
+// Delete old alert records to prevent unbounded growth
+function cleanupOldAlertRecords_(keepDays) {
+  const props = PropertiesService.getScriptProperties();
+  const all = props.getProperties();
+  const now = Date.now();
+  const ttlMs = (keepDays || 30) * 24 * 60 * 60 * 1000;
+
+  Object.keys(all).forEach(k => {
+    if (!k.startsWith("ALERTED_THREAD_")) return;
+    const t = Number(all[k]);
+    if (!isFinite(t)) return;
+    if (now - t > ttlMs) props.deleteProperty(k);
+  });
+}
